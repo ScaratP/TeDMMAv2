@@ -41,6 +41,7 @@ Docker sandbox -> 進一步驗證真實 Spring Boot 服務與容器環境
 |---|---|
 | `generate_docker_sandbox.py` | 自動複製 Java 專案、Karate、Pact，並產生完整 Docker sandbox。 |
 | `generate_docker_mock.py` | 自動產生 Pact stub server 與 Karate runner 的純 Mock sandbox。 |
+| `generate_docker_contract.py` | 產生 Karate 行為測試、Pact Provider verification 與 Pact JSON lint sandbox。 |
 | `main.py` | 讀取 Java 專案並執行 Tree-sitter 特徵擷取與單體分析流程。 |
 | `rag_migrate.py` | 使用 RAG/LLM 根據分析結果生成指定微服務的測試腳本。 |
 | `feature_capture.py` | 擷取 Java 專案中的特徵與結構資訊。 |
@@ -145,8 +146,40 @@ cd .\docker_sandbox_mock
 docker compose up --build --abort-on-container-exit
 ```
 
+### 4-1. 契約行為驗證 sandbox
 
-### 4-1. 備用方案：完整 Docker sandbox
+若要驗證真實 Provider，而不是只呼叫 Pact stub，使用獨立的契約 sandbox：
+
+```powershell
+python .\treesitter\generate_docker_contract.py `
+    --provider-url-template "http://host.docker.internal:8080" `
+    --clean
+cd .\docker_sandbox_contract
+docker compose up --build --abort-on-container-exit
+```
+
+這個 sandbox 分成三個責任：
+
+- `karate-runner`：呼叫真實 Provider，測試 API 行為與端點流程。
+- `*-pact-verifier`：使用 Pact CLI 依每份 Pact 呼叫真實 Provider，驗證 Consumer-Provider 契約行為。
+- `pact-lint`：使用 JSON Schema 檢查 Pact V3 結構、provider states 與必要欄位，不負責測試 API 行為。
+
+每個 Provider 的 URL 可用 `{provider}` 動態指定，例如：
+
+```powershell
+python .\treesitter\generate_docker_contract.py `
+    --provider-url-template "http://{provider}.internal:8080" `
+    --clean
+```
+
+報告位置：
+
+- `docker_sandbox_contract/test_reports/karate/karate_console.txt`
+- `docker_sandbox_contract/test_reports/pact/<provider>_verification.txt`
+- `docker_sandbox_contract/test_reports/pact/lint.txt`
+
+
+### 4-2. 備用方案：完整 Docker sandbox
 驗證真實 Spring Boot 服務在容器中的啟動、健康檢查、端點與運行狀態。
 
 ```powershell
@@ -164,7 +197,7 @@ docker compose up --build --abort-on-container-exit
 5. 移除 Pact JSON 開頭的 `//` 或 `#` 註解後驗證 JSON 格式。
 6. 產生兩個 Dockerfile、`docker-compose.yml` 與 `.gitignore`。
 
-### 4-1-1. 使用不同來源檔案
+### 4-2-1. 使用不同來源檔案
 
 ```powershell
 python .\treesitter\generate_docker_sandbox.py `

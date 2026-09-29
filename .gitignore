@@ -16,3 +16,9 @@ llm_analysis_result/
 monolith_features/
 monolith_test_case_codes/
 pact_contract/
+_state/
+docker_sandbox_contract/
+indices/
+snapshot_cache/
+*scratch/
+*test/
