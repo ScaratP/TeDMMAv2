@@ -4,6 +4,8 @@ import argparse
 import json
 import re
 import shutil
+import subprocess
+from datetime import datetime
 from pathlib import Path
 
 
@@ -12,6 +14,7 @@ DEFAULT_KARATE_DIR = WORKSPACE_ROOT / "treesitter/karate_feature"
 DEFAULT_PACT_DIR = WORKSPACE_ROOT / "treesitter/pact_contract"
 DEFAULT_FALLBACK_PACT_DIR = WORKSPACE_ROOT / "docker_sandbox_mock/tests/pact"
 DEFAULT_OUTPUT = WORKSPACE_ROOT / "docker_sandbox_mock"
+DEFAULT_REPORT = WORKSPACE_ROOT / "scratch/phase2_docker_report.json"
 
 
 def provider_for_feature(feature: Path) -> str:
@@ -129,12 +132,91 @@ def compose_file(providers: list[str], pact_files: list[str]) -> str:
             "    command: >",
             "      bash -c \"",
             "      echo '=== Karate Pact mock tests started ===' > /usr/src/app/target/karate_console.txt &&",
-            "      java -jar karate.jar . >> /usr/src/app/target/karate_console.txt 2>&1",
+            "      sleep 3 && java -jar karate.jar . >> /usr/src/app/target/karate_console.txt 2>&1",
             "      \"",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def write_phase2_report(
+    report_path: Path,
+    feature_count: int,
+    providers: list[str],
+    docker_exit_code: int | None,
+    console_path: Path,
+) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "karate_features_count": feature_count,
+        "providers": providers,
+        "docker_exit_code": docker_exit_code,
+        "status": "Pass" if docker_exit_code == 0 else "Fail",
+        "report_console_path": str(console_path.resolve()),
+    }
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def run_docker_tests(
+    output: Path,
+    feature_count: int,
+    providers: list[str],
+    report_path: Path,
+    auto_down: bool,
+) -> int | None:
+    compose_file_path = output / "docker-compose.yml"
+    console_path = output / "test_reports/karate/karate_console.txt"
+    docker_exit_code: int | None = None
+
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file_path),
+                "up",
+                "--build",
+                "--exit-code-from",
+                "karate-runner",
+            ],
+            check=False,
+        )
+        docker_exit_code = result.returncode
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as error:
+        print(f"Docker test execution failed: {error}")
+
+    write_phase2_report(
+        report_path,
+        feature_count,
+        providers,
+        docker_exit_code,
+        console_path,
+    )
+    print(f"Phase 2 report: {report_path.resolve()}")
+
+    if auto_down:
+        try:
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(compose_file_path),
+                    "down",
+                    "-v",
+                ],
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError) as error:
+            print(f"Docker cleanup failed: {error}")
+
+    return docker_exit_code
 
 
 def generate(
@@ -143,6 +225,9 @@ def generate(
     fallback_pact_dir: Path,
     output: Path,
     clean: bool,
+    run: bool,
+    auto_down: bool,
+    report_path: Path,
 ) -> None:
     karate_dir = karate_dir.resolve()
     pact_dir = pact_dir.resolve()
@@ -153,10 +238,37 @@ def generate(
     if not features:
         raise FileNotFoundError(f"No .feature files found in {karate_dir}")
 
-    feature_providers = [provider_for_feature(feature) for feature in features]
-    providers = list(dict.fromkeys(feature_providers))
+    feature_pairs = []
+    skipped_features = []
+    for feature in features:
+        provider = provider_for_feature(feature)
+        try:
+            pact_source = find_pact(provider, pact_dir, fallback_pact_dir)
+        except FileNotFoundError:
+            skipped_features.append((feature, provider))
+            continue
+        feature_pairs.append((feature, provider, pact_source))
 
-    pact_sources = [find_pact(provider, pact_dir, fallback_pact_dir) for provider in providers]
+    if not feature_pairs:
+        providers = sorted({provider_for_feature(feature) for feature in features})
+        raise FileNotFoundError(
+            "No feature/contract pairs found. "
+            f"Features require matching '*_contract*.json' files for providers: {', '.join(providers)}. "
+            f"Checked {pact_dir} and {fallback_pact_dir}."
+        )
+
+    if skipped_features:
+        skipped = ", ".join(feature.name for feature, _ in skipped_features)
+        print(f"Skipped features without a matching Pact contract: {skipped}")
+
+    features = [feature for feature, _, _ in feature_pairs]
+    feature_providers = [provider for _, provider, _ in feature_pairs]
+    providers = list(dict.fromkeys(feature_providers))
+    pact_sources = []
+    for provider in providers:
+        pact_sources.append(
+            next(source for _, pair_provider, source in feature_pairs if pair_provider == provider)
+        )
     pact_contents = [load_pact(path) for path in pact_sources]
 
     if output.exists() and clean:
@@ -193,6 +305,15 @@ def generate(
     print(f"Karate features: {len(features)}")
     print(f"Pact providers: {', '.join(providers)}")
 
+    if run:
+        run_docker_tests(
+            output,
+            len(features),
+            providers,
+            report_path.resolve(),
+            auto_down,
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -207,6 +328,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace an existing output directory.",
     )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the generated Docker Compose Karate tests.",
+    )
+    parser.add_argument(
+        "--auto-down",
+        action="store_true",
+        help="Run docker compose down -v after the test and report are finished.",
+    )
+    parser.add_argument(
+        "--report-path",
+        type=Path,
+        default=DEFAULT_REPORT,
+        help="Path for the phase 2 Docker report JSON.",
+    )
     return parser.parse_args()
 
 
@@ -218,4 +355,7 @@ if __name__ == "__main__":
         arguments.fallback_pact_dir,
         arguments.output,
         arguments.clean,
+        arguments.run,
+        arguments.auto_down,
+        arguments.report_path,
     )

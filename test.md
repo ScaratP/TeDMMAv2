@@ -149,12 +149,15 @@ Karate runner -> Pact stub server -> Pact contract
 
 它會：
 
-1. 讀取 `treesitter/karate_feature/` 下的所有 `.feature` 檔案。
+1. 讀取 `treesitter/karate_feature/` 下的 `.feature` 檔案。
 2. 根據 feature 檔名推導 Provider 名稱。
 3. 從 `treesitter/pact_contract/` 尋找對應 Pact contract。
 4. 若主要契約目錄找不到，改從 `docker_sandbox_mock/tests/pact/` 尋找備援契約。
-5. 將 Karate 內的 localhost、127.0.0.1 或其他 HTTP host 改寫成對應的 Pact stub service host。
-6. 產生 Docker Compose、Karate runner Dockerfile 與 Pact contract 檔案。
+5. 只保留有對應 Pact contract 的 feature；找不到契約的 feature 會顯示略過訊息，不會阻止其他配對項目執行。
+6. 將 Karate 內的 localhost、127.0.0.1 或其他 HTTP host 改寫成對應的 Pact stub service host。
+7. 產生 Docker Compose、Karate runner Dockerfile 與 Pact contract 檔案。
+
+如果只有一份 `*_api_test.feature` 與一份對應的 `*_contract.json`，sandbox 只會測試這一組。若完全沒有任何可配對的 feature/contract，程式會停止並顯示錯誤。
 
 特殊映射：
 
@@ -178,6 +181,18 @@ python .\treesitter\generate_docker_mock.py --clean
 
 `--clean` 會刪除既有的 `docker_sandbox_mock/` 後重新產生。若不使用 `--clean`，而輸出目錄已存在且不是空目錄，程式會停止以避免覆蓋既有內容。
 
+若要在生成後立即執行 Docker 測試：
+
+```powershell
+python .\treesitter\generate_docker_mock.py --clean --run
+```
+
+若測試完成後自動移除容器、網路與 volume：
+
+```powershell
+python .\treesitter\generate_docker_mock.py --clean --run --auto-down
+```
+
 ### 3.3 自訂輸入與輸出位置
 
 ```powershell
@@ -198,6 +213,9 @@ python .\treesitter\generate_docker_mock.py `
 | `--fallback-pact-dir` | `docker_sandbox_mock/tests/pact` | 找不到主要契約時使用的備援目錄。 |
 | `--output` | `docker_sandbox_mock` | sandbox 輸出目錄。 |
 | `--clean` | 未啟用 | 清除並重建輸出目錄。 |
+| `--run` | 未啟用 | 生成完成後執行 `docker compose up --build --exit-code-from karate-runner`。 |
+| `--auto-down` | 未啟用 | 測試與報告完成後執行 `docker compose down -v`。 |
+| `--report-path` | `scratch/phase2_docker_report.json` | 指定階段二 Docker 報告輸出位置。 |
 
 ### 3.4 預期產物
 
@@ -226,6 +244,22 @@ Pact providers: <provider 名稱列表>
 ```
 
 ### 3.5 啟動 Docker 測試
+
+推薦由腳本自動生成並執行：
+
+```powershell
+python .\treesitter\generate_docker_mock.py --clean --run
+```
+
+腳本會執行：
+
+```text
+docker compose -f <output_dir>/docker-compose.yml up --build --exit-code-from karate-runner
+```
+
+`karate-runner` 執行前會等待 3 秒，讓 Pact stub server 完成啟動。Exit Code 為 `0` 時，階段二結果為 `Pass`；其他 Exit Code 或 Docker 啟動例外則為 `Fail`。
+
+也可以只生成 sandbox，再手動啟動：
 
 ```powershell
 Set-Location .\docker_sandbox_mock
@@ -271,6 +305,27 @@ docker_sandbox_mock/test_reports/karate/karate-reports*/karate-summary.html
 Get-Content .\test_reports\karate\karate_console.txt
 ```
 
+階段二門禁報告預設位置：
+
+```text
+scratch/phase2_docker_report.json
+```
+
+報告包含：
+
+- `timestamp`：ISO 8601 執行時間。
+- `karate_features_count`：實際納入測試的 feature 數量。
+- `providers`：實際啟動的 Provider 清單。
+- `docker_exit_code`：`karate-runner` 的 Docker Exit Code；Docker 無法啟動時為 `null`。
+- `status`：`Pass` 或 `Fail`。
+- `report_console_path`：Karate console 報告路徑。
+
+若使用 `--auto-down`，報告寫入完成後才會執行：
+
+```powershell
+docker compose -f <output_dir>\docker-compose.yml down -v
+```
+
 ## 4. 建議測試順序
 
 建議先執行單一 Pact 的 TDD 驗證，再建立完整 Mock Docker sandbox：
@@ -281,10 +336,9 @@ Set-Location C:\Users\User\Desktop\2026SOSELab\yi\TeDMMAv2
 python .\treesitter\generate_pact_tdd.py `
   --contract .\treesitter\pact_contract\vet-service_contract.json
 
-python .\treesitter\generate_docker_mock.py --clean
+python .\treesitter\generate_docker_mock.py --clean --run --auto-down
 
-Set-Location .\docker_sandbox_mock
-docker compose up --build --abort-on-container-exit
+Get-Content .\scratch\phase2_docker_report.json
 ```
 
 判讀方式：
@@ -294,7 +348,7 @@ docker compose up --build --abort-on-container-exit
 | Pact RED | 未啟動 Provider 回傳 connection refused 或 404 | 驗證尚未實作或尚未啟動時能被辨識。 |
 | Pact GREEN | Pact mock 回應符合 status 與 body | `scratch/phase1_tdd_report.json`。 |
 | Mock sandbox 產生 | feature 與 Pact 都能找到且格式正確 | `docker_sandbox_mock/`。 |
-| Mock sandbox 執行 | Karate runner 測試通過 | `test_reports/karate/` 下的 log 與 HTML 報告。 |
+| Mock sandbox 執行 | `karate-runner` Exit Code 為 `0` | `scratch/phase2_docker_report.json` 與 `test_reports/karate/` 下的 log、HTML 報告。 |
 
 ## 5. 常見問題
 
@@ -308,6 +362,13 @@ vet-service_contract.json
 ```
 
 必要時使用 `--pact-dir` 或 `--fallback-pact-dir` 指定正確目錄。
+
+若同時存在多份 feature，但只有部分 feature 有契約，程式會略過無對應契約的 feature，只測試可配對的項目。例如：
+
+```text
+spring-petclinic-main_api_test.feature  -> 略過，找不到 pet-service_contract*.json
+vet-service_api_test.feature             -> 執行，找到 vet-service_contract.json
+```
 
 ### 輸出目錄不是空的
 
