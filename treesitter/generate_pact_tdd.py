@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,10 +117,28 @@ def endpoint_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
-def run_red_verification(interactions: list[Interaction], base_url: str) -> bool:
+def run_red_verification(
+    interactions: list[Interaction], base_url: str
+) -> tuple[bool, list[dict[str, Any]]]:
     passed = True
+    results: list[dict[str, Any]] = []
     for interaction in interactions:
         url = endpoint_url(base_url, interaction.path)
+        started = time.perf_counter()
+        result: dict[str, Any] = {
+            "description": interaction.description,
+            "provider_state": interaction.provider_state,
+            "method": interaction.method,
+            "path": interaction.path,
+            "url": url,
+            "expected_status": "connection refused or 404",
+            "actual_status": None,
+            "request_body": interaction.request_body,
+            "expected_body": None,
+            "actual_body": None,
+            "status": "Fail",
+            "failure_reason": None,
+        }
         try:
             response = requests.request(
                 interaction.method,
@@ -130,17 +149,28 @@ def run_red_verification(interactions: list[Interaction], base_url: str) -> bool
             )
         except requests.exceptions.ConnectionError:
             print(f"[TDD RED LIGHT] 🔴 成功捕捉連線拒絕/未啟動錯誤！驗證端點 {url} 尚未就緒。")
-            continue
+            result["status"] = "Pass"
+            result["actual_status"] = "connection refused"
         except requests.exceptions.RequestException as error:
             print(f"[TDD RED LIGHT] 🔴 端點請求失敗 {url}: {error}")
             passed = False
-            continue
-        if response.status_code == 404:
-            print(f"[TDD RED LIGHT] 🔴 成功捕捉連線拒絕/未啟動錯誤！驗證端點 {url} 尚未就緒。")
+            result["failure_reason"] = str(error)
         else:
-            print(f"[TDD RED LIGHT] ⚠️ 端點 {url} 回應 HTTP {response.status_code}，未符合預期的未就緒狀態。")
-            passed = False
-    return passed
+            result["actual_status"] = response.status_code
+            if response.status_code == 404:
+                print(f"[TDD RED LIGHT] 🔴 成功捕捉連線拒絕/未啟動錯誤！驗證端點 {url} 尚未就緒。")
+                result["status"] = "Pass"
+            else:
+                print(f"[TDD RED LIGHT] ⚠️ 端點 {url} 回應 HTTP {response.status_code}，未符合預期的未就緒狀態。")
+                passed = False
+                result["failure_reason"] = f"未預期的 HTTP status: {response.status_code}"
+            try:
+                result["actual_body"] = response.json()
+            except ValueError:
+                result["actual_body"] = response.text
+        result["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        results.append(result)
+    return passed, results
 
 
 def assert_response_body(response: requests.Response, expected: Any) -> None:
@@ -156,28 +186,31 @@ def assert_response_body(response: requests.Response, expected: Any) -> None:
 
 def build_pact(consumer_name: str, provider_name: str, interactions: list[Interaction]) -> Any:
     try:
-        from pact import Consumer, Provider
+        from pact import Pact
     except ImportError as error:
-        raise RuntimeError("缺少 pact-python，請先執行: pip install pact-python") from error
+        raise RuntimeError("缺少新版 pact-python，請先執行: python -m pip install -U pact-python") from error
 
-    pact = Consumer(consumer_name).has_pact_with(Provider(provider_name))
+    pact = Pact(consumer_name, provider_name)
     for interaction in interactions:
-        configured = (
-            pact.given(interaction.provider_state)
-            .upon_receiving(interaction.description)
-            .with_request(
-                interaction.method,
-                interaction.path,
-                headers=interaction.request_headers or None,
-            )
-        )
+        configured = pact.upon_receiving(interaction.description).given(interaction.provider_state)
+        configured.with_request(interaction.method, interaction.path)
+        for name, value in interaction.request_headers.items():
+            configured.with_header(name, value, part="Request")
         if interaction.request_body is not None:
-            configured.with_body(interaction.request_body)
-        configured.will_respond_with(
-            interaction.expected_status,
-            headers=interaction.response_headers or None,
-            body=interaction.response_body,
-        )
+            configured.with_body(
+                interaction.request_body,
+                content_type="application/json",
+                part="Request",
+            )
+        configured.will_respond_with(interaction.expected_status)
+        for name, value in interaction.response_headers.items():
+            configured.with_header(name, value, part="Response")
+        if interaction.response_body is not None:
+            configured.with_body(
+                interaction.response_body,
+                content_type="application/json",
+                part="Response",
+            )
     return pact
 
 
@@ -185,46 +218,124 @@ def run_green_verification(
     consumer_name: str,
     provider_name: str,
     interactions: list[Interaction],
-) -> bool:
+) -> tuple[bool, list[dict[str, Any]]]:
+    results: list[dict[str, Any]] = []
+    mock_server_url: str | None = None
     try:
+        from pact.error import MismatchesError
+
         pact = build_pact(consumer_name, provider_name, interactions)
-        with pact:
+        with pact.serve() as mock_server:
+            mock_server_url = str(mock_server.url)
             for interaction in interactions:
-                url = endpoint_url(pact.uri, interaction.path)
-                response = requests.request(
-                    interaction.method,
-                    url,
-                    headers=interaction.request_headers or None,
-                    json=interaction.request_body,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                assert response.status_code == interaction.expected_status, (
-                    f"{interaction.description}: 預期 HTTP {interaction.expected_status}，"
-                    f"實際 {response.status_code}"
-                )
-                assert_response_body(response, interaction.response_body)
+                started = time.perf_counter()
+                result: dict[str, Any] = {
+                    "description": interaction.description,
+                    "provider_state": interaction.provider_state,
+                    "method": interaction.method,
+                    "path": interaction.path,
+                    "url": endpoint_url(mock_server_url, interaction.path),
+                    "expected_status": interaction.expected_status,
+                    "actual_status": None,
+                    "request_body": interaction.request_body,
+                    "expected_body": interaction.response_body,
+                    "actual_body": None,
+                    "status": "Fail",
+                    "failure_reason": None,
+                }
+                url = endpoint_url(str(mock_server.url), interaction.path)
+                try:
+                    response = requests.request(
+                        interaction.method,
+                        url,
+                        headers=interaction.request_headers or None,
+                        json=interaction.request_body,
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
+                    result["actual_status"] = response.status_code
+                    try:
+                        result["actual_body"] = response.json()
+                    except ValueError:
+                        result["actual_body"] = response.text
+                    assert response.status_code == interaction.expected_status, (
+                        f"{interaction.description}: 預期 HTTP {interaction.expected_status}，"
+                        f"實際 {response.status_code}"
+                    )
+                    assert_response_body(response, interaction.response_body)
+                    result["status"] = "Pass"
+                except (AssertionError, requests.exceptions.RequestException) as error:
+                    result["failure_reason"] = str(error)
+                finally:
+                    result["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                    results.append(result)
         print("[TDD GREEN LIGHT] 🟢 Pact DSL 斷言成功！Mock Server 已精準回傳符合契約 Schema 之回應。")
-        return True
-    except (AssertionError, requests.exceptions.RequestException, RuntimeError, OSError, TypeError) as error:
+        return all(result["status"] == "Pass" for result in results), results
+    except (
+        AssertionError,
+        MismatchesError,
+        requests.exceptions.RequestException,
+        RuntimeError,
+        OSError,
+        TypeError,
+    ) as error:
         print(f"[TDD GREEN LIGHT] 🔴 Pact DSL 驗證失敗: {error}")
-        return False
+        if not results:
+            results = [
+                {
+                    "description": interaction.description,
+                    "provider_state": interaction.provider_state,
+                    "method": interaction.method,
+                    "path": interaction.path,
+                    "url": endpoint_url(mock_server_url, interaction.path)
+                    if mock_server_url
+                    else None,
+                    "expected_status": interaction.expected_status,
+                    "actual_status": None,
+                    "request_body": interaction.request_body,
+                    "expected_body": interaction.response_body,
+                    "actual_body": None,
+                    "status": "Fail",
+                    "failure_reason": str(error),
+                    "duration_ms": None,
+                }
+                for interaction in interactions
+            ]
+        return False, results
 
 
 def write_report(
     report_path: Path,
     consumer_name: str,
     provider_name: str,
+    contract_path: Path,
+    started_at: str,
+    finished_at: str,
     red_passed: bool,
+    red_results: list[dict[str, Any]],
     green_passed: bool,
+    green_results: list[dict[str, Any]],
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "consumer": consumer_name,
         "provider": provider_name,
-        "red_light": "Pass" if red_passed else "Fail",
-        "green_light": "Pass" if green_passed else "Fail",
+        "contract_path": str(contract_path),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": None,
+        "red_light": {
+            "status": "Pass" if red_passed else "Fail",
+            "interactions": red_results,
+        },
+        "green_light": {
+            "status": "Pass" if green_passed else "Fail",
+            "interactions": green_results,
+        },
     }
+    started = datetime.fromisoformat(started_at)
+    finished = datetime.fromisoformat(finished_at)
+    report["duration_ms"] = round((finished - started).total_seconds() * 1000, 3)
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -239,18 +350,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     consumer_name = provider_name = "unknown"
+    contract_path = args.contract or Path("unknown")
+    started_at = datetime.now(timezone.utc).isoformat()
+    finished_at = started_at
     red_passed = green_passed = False
+    red_results: list[dict[str, Any]] = []
+    green_results: list[dict[str, Any]] = []
     try:
         contract_path = select_contract(args.contract)
         consumer_name, provider_name, interactions = parse_contract(contract_path)
         print(f"使用 Pact 契約: {contract_path}")
-        red_passed = run_red_verification(interactions, args.provider_url)
-        green_passed = run_green_verification(consumer_name, provider_name, interactions)
+        red_passed, red_results = run_red_verification(interactions, args.provider_url)
+        green_passed, green_results = run_green_verification(consumer_name, provider_name, interactions)
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"Pact TDD 執行失敗: {error}", file=sys.stderr)
     finally:
+        finished_at = datetime.now(timezone.utc).isoformat()
         try:
-            write_report(args.report, consumer_name, provider_name, red_passed, green_passed)
+            write_report(
+                args.report,
+                consumer_name,
+                provider_name,
+                contract_path,
+                started_at,
+                finished_at,
+                red_passed,
+                red_results,
+                green_passed,
+                green_results,
+            )
         except OSError as error:
             print(f"無法寫入 TDD 報告 {args.report}: {error}", file=sys.stderr)
             return 1
