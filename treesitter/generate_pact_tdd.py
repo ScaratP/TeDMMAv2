@@ -268,7 +268,7 @@ def run_green_verification(
                 finally:
                     result["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
                     results.append(result)
-        print("[TDD GREEN LIGHT] 🟢 Pact DSL 斷言成功！Mock Server 已精準回傳符合契約 Schema 之回應。")
+        print("[TDD GREEN LIGHT] 🟢 Pact DSL Mock Server 已精準回傳符合契約 Schema 之回應。")
         return all(result["status"] == "Pass" for result in results), results
     except (
         AssertionError,

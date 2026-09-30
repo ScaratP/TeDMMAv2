@@ -1,9 +1,10 @@
 # 測試說明
 
-本文件說明以下兩支工具的使用方法與預期成果：
+本文件說明以下三支工具的使用方法與預期成果：
 
 - `treesitter/generate_pact_tdd.py`
 - `treesitter/generate_docker_mock.py`
+- `treesitter/generate_rag_backfill.py`
 
 兩者的定位不同：
 
@@ -45,8 +46,6 @@ treesitter/pact_contract/*.json
 ### 2.1 使用目的
 
 `generate_pact_tdd.py` 會讀取一份 Pact JSON，解析其中的 consumer、provider 與 interactions，依序執行：
-
-1. RED light：確認尚未啟動的 Provider 會回傳 connection refused 或 HTTP 404。
 2. GREEN light：使用 Pact Python 建立臨時 mock server，依 Pact contract 回應請求，並驗證 HTTP status 與 JSON response body。
 3. 寫入完整測試報告。
 
@@ -152,10 +151,6 @@ Karate runner -> Pact stub server -> Pact contract
 1. 讀取 `treesitter/karate_feature/` 下的 `.feature` 檔案。
 2. 根據 feature 檔名推導 Provider 名稱。
 3. 從 `treesitter/pact_contract/` 尋找對應 Pact contract。
-4. 若主要契約目錄找不到，改從 `docker_sandbox_mock/tests/pact/` 尋找備援契約。
-5. 只保留有對應 Pact contract 的 feature；找不到契約的 feature 會顯示略過訊息，不會阻止其他配對項目執行。
-6. 將 Karate 內的 localhost、127.0.0.1 或其他 HTTP host 改寫成對應的 Pact stub service host。
-7. 產生 Docker Compose、Karate runner Dockerfile 與 Pact contract 檔案。
 
 如果只有一份 `*_api_test.feature` 與一份對應的 `*_contract.json`，sandbox 只會測試這一組。若完全沒有任何可配對的 feature/contract，程式會停止並顯示錯誤。
 
@@ -172,16 +167,6 @@ vet-service_api_test.feature -> vet-service
 ```
 
 ### 3.2 產生 sandbox
-
-在專案根目錄執行：
-
-```powershell
-python .\treesitter\generate_docker_mock.py --clean
-```
-
-`--clean` 會刪除既有的 `docker_sandbox_mock/` 後重新產生。若不使用 `--clean`，而輸出目錄已存在且不是空目錄，程式會停止以避免覆蓋既有內容。
-
-若要在生成後立即執行 Docker 測試：
 
 ```powershell
 python .\treesitter\generate_docker_mock.py --clean --run
@@ -326,7 +311,175 @@ scratch/phase2_docker_report.json
 docker compose -f <output_dir>\docker-compose.yml down -v
 ```
 
-## 4. 建議測試順序
+## 4. Phase 3 RAG backfill
+
+### 4.1 使用目的
+
+`generate_rag_backfill.py` 負責將已通過前置測試的微服務測試資產整理至 RAG 知識庫，並嘗試寫入 Elasticsearch。執行流程如下：
+
+1. 讀取 Phase 1 與 Phase 2 JSON 報告並執行門禁檢查。
+2. 遞迴尋找指定服務最新修改的 Karate `.feature` 與 Pact `.json`。
+3. 移除 Karate/JSON 的 Markdown code fence，並驗證 Pact 包含 `provider.name`。
+4. 將每種資產複製至兩個目標位置：專案資產目錄與 RAG 知識庫目錄。
+5. 使用 `sentence-transformers/all-MiniLM-L6-v2` 產生向量，以 `OVERWRITE` 策略寫入 Elasticsearch。
+6. 寫入 Phase 3 JSON 報告。
+
+檔案歸位與 Elasticsearch 回填是兩個獨立步驟。即使 Elasticsearch 未啟動或連線失敗，檔案仍會完成歸位，但程式會以 exit code `1` 結束，且報告的 `elasticsearch.status` 與 `status` 會是 `Fail`。
+
+### 4.2 執行方式
+
+請在專案根目錄執行：
+
+```powershell
+python .\treesitter\generate_rag_backfill.py `
+  --service-name vet-service
+```
+
+預設會讀取：
+
+```text
+scratch/phase1_tdd_report.json
+scratch/phase2_docker_report.json
+```
+
+也可以指定專案、報告與 Elasticsearch 位址：
+
+```powershell
+python .\treesitter\generate_rag_backfill.py `
+  --project-name spring-petclinic-main `
+  --service-name vet-service `
+  --phase1-report .\scratch\phase1_tdd_report.json `
+  --phase2-report .\scratch\phase2_docker_report.json `
+  --report .\scratch\phase3_rag_report.json `
+  --es-host http://localhost:9200
+```
+
+若需要在門禁未通過時強制執行，可使用 `--force`：
+
+```powershell
+python .\treesitter\generate_rag_backfill.py `
+  --service-name vet-service `
+  --force
+```
+
+### 4.3 門禁條件
+
+| 報告 | 必要條件 |
+|---|---|
+| `scratch/phase1_tdd_report.json` | `red_light.status = Pass` 且 `green_light.status = Pass` |
+| `scratch/phase2_docker_report.json` | `status = Pass` 且 `docker_exit_code = 0` |
+
+兩份報告無法讀取、不是有效 JSON，或不符合上述條件時，門禁視為 `Fail`。門禁失敗且未使用 `--force` 時，終端機會顯示：
+
+```text
+[RAG BACKFILL BLOCKED] ⛔ 前置階段測試未完全通過，中斷 RAG 回填作業！
+```
+
+程式會產生 `status = Blocked` 的 Phase 3 報告，並以 Exit Code `1` 結束；不會執行資產複製或 Elasticsearch 回填。
+
+門禁成功時會顯示：
+
+```text
+[GATEKEEPER CHECK] 🟢 Phase 1 & Phase 2 測試報告均為 Pass，准予進行資產歸位與 RAG 回填。
+```
+
+也可以使用 `--force` 忽略門禁繼續執行。此時報告仍會保留實際的 `gatekeeper` 結果，方便辨識這次回填不是在完整通過前置測試後執行。
+
+### 4.4 測試資產歸位
+
+腳本會在下列根目錄遞迴尋找符合服務名稱的最新檔案：
+
+```text
+treesitter/karate_feature/**/*vet-service_api_test.feature
+treesitter/pact_contract/**/*vet-service_contract.json
+```
+
+例如 `--service-name vet-service` 時，資產會寫入以下四個目標檔案：
+
+```text
+treesitter/karate_feature/spring-petclinic-main/vet-service_api_test.feature
+treesitter/rag_knowledge_base/karate/vet-service_api_test.feature
+treesitter/pact_contract/spring-petclinic-main/vet-service_contract.json
+treesitter/rag_knowledge_base/pact/v3/pass/vet-service_contract.json
+```
+
+Karate 檔案若包含 `gherkin`、`karate` 或 `feature` Markdown code fence，腳本會只保留其中的 Feature 內容，並確認存在 `Feature:` 宣告。Pact 檔案會移除開頭的 `//` 或 `#` 註解，解析為 JSON，並確認 `provider.name` 存在；兩種檔案最後都以 UTF-8 寫入。
+
+每種來源資產會複製到兩個目標，因此正常回填會產生 4 筆 Elasticsearch 文件，而不是只產生 2 筆。
+
+### 4.5 Elasticsearch 回填
+
+回填使用以下設定：
+
+```text
+Index: {project_name}_migration_docs
+Embedding model: sentence-transformers/all-MiniLM-L6-v2
+Duplicate policy: OVERWRITE
+```
+
+文件 metadata 包含：
+
+- Karate：`category = karate_specification`
+- Pact：`category = pact_passed_example`
+- `file_name`：每個歸位後檔案的絕對路徑。
+- `service`：`--service-name` 指定的微服務名稱。
+
+成功完成時會顯示：
+
+```text
+[RAG BACKFILL COMPLETE] 🚀 已成功將 4 筆測試資產寫入 Elasticsearch (spring-petclinic-main_migration_docs)，完成 N+1 服務之檢索準備！
+```
+
+若 Elasticsearch 套件、Embedding model 或 Elasticsearch 服務不可用，終端機會顯示 `[RAG BACKFILL WARNING]`。此情況不會撤銷已完成的檔案歸位，程式仍會產生報告，但回傳 exit code `1`。
+
+### 4.6 Phase 3 報告
+
+預設報告位置：
+
+```text
+scratch/phase3_rag_report.json
+```
+
+報告包含：
+
+- `timestamp`：ISO 8601 執行時間。
+- `service_name`：本次回填的微服務名稱。
+- `gatekeeper`：Phase 1、Phase 2 門禁狀態與總結果。
+- `relocated_files`：來源檔案、類型與所有目標路徑。
+- `elasticsearch.index`：寫入的 Elasticsearch index。
+- `elasticsearch.indexed_documents_count`：成功寫入的文件數量。
+- `elasticsearch.status`：`Pass` 或 `Fail`。
+- `status`：`Pass`、`Fail` 或 `Blocked`。
+- `error`：門禁阻擋、資產處理失敗或 Elasticsearch 回填失敗時的錯誤訊息（有錯誤才會出現）。
+
+可用 PowerShell 檢視結果：
+
+```powershell
+Get-Content .\scratch\phase3_rag_report.json
+```
+
+| 結果 | 意義 |
+|---|---|
+| `Pass` | 前置階段通過、資產歸位完成，且 Elasticsearch 回填成功。 |
+| `Fail` | 資產找不到、格式驗證失敗，或 Elasticsearch 回填失敗。 |
+| `Blocked` | Phase 1 或 Phase 2 未通過，且未使用 `--force`。 |
+
+### 4.7 Exit code 與驗證
+
+| Exit code | 意義 |
+|---|---|
+| `0` | 四筆資產已完成歸位，且 Elasticsearch 回填成功。 |
+| `1` | 門禁被阻擋、資產處理失敗，或 Elasticsearch 回填失敗。 |
+
+執行後可用下列命令確認報告與資產數量：
+
+```powershell
+Get-Content .\scratch\phase3_rag_report.json
+Get-ChildItem .\treesitter\rag_knowledge_base\karate\vet-service_api_test.feature
+Get-ChildItem .\treesitter\rag_knowledge_base\pact\v3\pass\vet-service_contract.json
+```
+
+## 5. 建議測試順序
 
 建議先執行單一 Pact 的 TDD 驗證，再建立完整 Mock Docker sandbox：
 
@@ -350,7 +503,7 @@ Get-Content .\scratch\phase2_docker_report.json
 | Mock sandbox 產生 | feature 與 Pact 都能找到且格式正確 | `docker_sandbox_mock/`。 |
 | Mock sandbox 執行 | `karate-runner` Exit Code 為 `0` | `scratch/phase2_docker_report.json` 與 `test_reports/karate/` 下的 log、HTML 報告。 |
 
-## 5. 常見問題
+## 6. 常見問題
 
 ### 找不到 Pact contract
 
